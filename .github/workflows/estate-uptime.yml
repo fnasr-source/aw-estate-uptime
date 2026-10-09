@@ -1,0 +1,212 @@
+# Estate uptime monitor. Canonical source: scripts/estate-uptime/ in the Internal
+# OS repo. Published by COPYING to .github/workflows/estate-uptime.yml in the
+# public repo; never edit the public copy. See README.md.
+#
+# Alerts are GitHub's own "run failed" emails (owner decision D58 rework,
+# 2026-10-09: email, not ntfy; no paid service). A run fails ONLY on a state
+# change, so one outage sends one email when it starts and one when it ends:
+#   - job "ALERT estate host down"     fails when hosts go from up to down;
+#   - job "NOTICE estate recovered"    fails when hosts go from down to up;
+#   - job "ALERT monitor was silent"   fails when the previous scheduled run is
+#     more than 2 hours old (the schedule itself stopped firing);
+#   - a manual run (workflow_dispatch) fails whenever its check fails, so a test
+#     with a .invalid extra_url proves the email path end to end.
+# The current state is recorded by job "state hosts down", which SUCCEEDS on every
+# run while a host is down and is skipped otherwise; the next run reads it from the
+# previous scheduled run to tell a new outage from a continuing one. The email
+# names only the failed job, never a host.
+name: estate-uptime
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+    inputs:
+      extra_url:
+        description: 'Optional extra URL to check on top of the host list (visible in the run summary; never put a client host here)'
+        required: false
+        default: ''
+        type: string
+
+# Least privilege. The heartbeat job raises contents to write for itself only.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: estate-uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      cur: ${{ steps.decide.outputs.cur }}
+      transition: ${{ steps.decide.outputs.transition }}
+      silent: ${{ steps.decide.outputs.silent }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Public run logs are readable by anyone. The host list comes from a
+      # SECRET (a variable would be printed unmasked in the step header before
+      # any mask could apply), and every host name is also registered with
+      # ::add-mask:: so it shows as *** in all later output of this job.
+      - name: Mask host names
+        env:
+          ESTATE_HOSTS: ${{ secrets.ESTATE_HOSTS }}
+          EXTRA_URL: ${{ inputs.extra_url }}
+        run: |
+          if [ -n "${ESTATE_HOSTS:-}" ]; then
+            for h in $(bash check.sh --hosts-line); do
+              echo "::add-mask::$h"
+            done
+          fi
+          if [ -n "${EXTRA_URL:-}" ]; then
+            echo "::add-mask::$EXTRA_URL"
+            xh=${EXTRA_URL#*://}
+            xh=${xh%%/*}
+            [ -z "$xh" ] || echo "::add-mask::$xh"
+          fi
+
+      # Never fails the step itself: the verdict is carried in the rc output.
+      - name: Check hosts
+        id: check
+        env:
+          ESTATE_HOSTS: ${{ secrets.ESTATE_HOSTS }}
+          EXTRA_URL: ${{ inputs.extra_url }}
+        run: |
+          set +e
+          if [ -n "${EXTRA_URL:-}" ]; then
+            bash check.sh "$EXTRA_URL" > check.out
+          else
+            bash check.sh > check.out
+          fi
+          rc=$?
+          cat check.out
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # Reads the previous completed scheduled run: its age (silent monitor) and
+      # whether its "state hosts down" job succeeded (it was down). If history
+      # cannot be read, a failing check is treated as a new outage, so the
+      # monitor errs toward an email rather than toward silence.
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK_RC: ${{ steps.check.outputs.rc }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          rc="${CHECK_RC:-}"
+          [ -n "$rc" ] || rc=2
+          if [ "$rc" = 0 ]; then cur=ok; else cur=fail; fi
+          transition=none; silent=no
+          if [ "$EVENT" = schedule ]; then
+            prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow estate-uptime.yml \
+                     --event schedule --status completed --limit 10 \
+                     --json databaseId,createdAt \
+                     --jq '[.[] | select(.databaseId != '"$GITHUB_RUN_ID"')][0] | if . == null then "none 0" else "\(.databaseId) \(.createdAt | fromdateiso8601)" end' \
+                     2>/dev/null) || prev=""
+            if [ -z "$prev" ]; then
+              echo "history unreadable"
+              [ "$cur" = fail ] && transition=down
+            elif [ "${prev%% *}" = none ]; then
+              echo "first scheduled run"
+              [ "$cur" = fail ] && transition=down
+            else
+              prev_id=${prev%% *}; prev_epoch=${prev##* }
+              gap=$(( $(date +%s) - prev_epoch ))
+              [ "$gap" -gt 7200 ] && silent=yes
+              was=$(gh run view "$prev_id" -R "$GITHUB_REPOSITORY" --json jobs \
+                      --jq '[.jobs[] | select(.name == "state hosts down" and .conclusion == "success")] | length' \
+                      2>/dev/null) || was=""
+              if [ -z "$was" ]; then
+                echo "previous state unreadable"
+                [ "$cur" = fail ] && transition=down
+              else
+                if [ "$was" -gt 0 ]; then prevs=fail; else prevs=ok; fi
+                if [ "$cur" = fail ] && [ "$prevs" = ok ]; then transition=down; fi
+                if [ "$cur" = ok ] && [ "$prevs" = fail ]; then transition=recovered; fi
+                echo "previous run $prev_id: $prevs; now: $cur; gap ${gap}s"
+              fi
+            fi
+          else
+            [ "$cur" = fail ] && transition=manual_fail
+          fi
+          echo "cur=$cur transition=$transition silent=$silent"
+          { echo "cur=$cur"; echo "transition=$transition"; echo "silent=$silent"; } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Estate check"
+            echo "state: $cur, transition: $transition, silent monitor: $silent"
+            echo "failing entries: $(grep -c '^FAIL ' check.out || true) (names are not written here: summaries are public)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  state-down:
+    name: state hosts down
+    needs: check
+    if: needs.check.outputs.cur == 'fail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "one or more hosts are down (recorded for the next run)"
+
+  alert-down:
+    name: ALERT estate host down
+    needs: check
+    if: needs.check.outputs.transition == 'down' || needs.check.outputs.transition == 'manual_fail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::One or more estate hosts stopped answering 200. Host names are masked in this public log; run bash scripts/estate-uptime/check.sh in Internal OS to see which."
+          exit 1
+
+  alert-recovered:
+    name: NOTICE estate recovered
+    needs: check
+    if: needs.check.outputs.transition == 'recovered'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::All estate hosts answer 200 again. This job fails on purpose so GitHub sends the recovery email."
+          exit 1
+
+  alert-silent:
+    name: ALERT monitor was silent
+    needs: check
+    if: needs.check.outputs.silent == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::No scheduled run for more than 2 hours before this one; GitHub delayed or skipped the schedule."
+          exit 1
+
+  # Monthly commit so GitHub never disables the schedule after 60 days without
+  # repository activity. The only job with write access.
+  heartbeat:
+    if: github.event_name == 'schedule' && github.event.schedule == '17 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Commit heartbeat
+        run: |
+          date -u +%Y-%m-%d > heartbeat.txt
+          if git ls-files --error-unmatch heartbeat.txt > /dev/null 2>&1 && git diff --quiet -- heartbeat.txt; then
+            echo "heartbeat already recorded today"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -m "heartbeat $(cat heartbeat.txt)"
+          git push
