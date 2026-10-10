@@ -2,8 +2,11 @@
 # OS repo. Published by COPYING to .github/workflows/estate-uptime.yml in the
 # public repo; never edit the public copy. See README.md.
 #
-# Alerts are GitHub's own "run failed" emails (owner decision D58 rework,
-# 2026-10-09: email, not ntfy; no paid service). A run fails ONLY on a state
+# Alerts are emails (owner decision D58 rework, 2026-10-09: email, not ntfy; no
+# paid service). Each alert job first sends a direct email through Resend with a
+# sending-only key for admireworks.com (secrets RESEND_ALERT_KEY and ALERT_TO;
+# added 2026-10-10 because GitHub's own "run failed" mail never arrived), then
+# fails so the run is red and GitHub's mail is a second channel. A run fails ONLY on a state
 # change, so one outage sends one email when it starts and one when it ends:
 #   - job "ALERT estate host down"     fails when hosts go from up to down;
 #   - job "NOTICE estate recovered"    fails when hosts go from down to up;
@@ -161,6 +164,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
+      - name: Email the alert
+        env:
+          RESEND_ALERT_KEY: ${{ secrets.RESEND_ALERT_KEY }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${RESEND_ALERT_KEY:-}" ] || [ -z "${ALERT_TO:-}" ]; then
+            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no direct email"
+            exit 0
+          fi
+          body=$(jq -n --arg to "$ALERT_TO" --arg subject "AW estate: a host is down" \
+            --arg text "One or more estate hosts stopped answering 200. Host names are not in this email or the public log; run bash scripts/estate-uptime/check.sh in Internal OS to see which. Run: $RUN_URL" \
+            '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
+          if curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
+               -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
+               -d "$body" > /dev/null; then
+            echo "alert email sent"
+          else
+            echo "::error::alert email failed"
+          fi
       - run: |
           echo "::error::One or more estate hosts stopped answering 200. Host names are masked in this public log; run bash scripts/estate-uptime/check.sh in Internal OS to see which."
           exit 1
@@ -172,6 +195,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
+      - name: Email the alert
+        env:
+          RESEND_ALERT_KEY: ${{ secrets.RESEND_ALERT_KEY }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${RESEND_ALERT_KEY:-}" ] || [ -z "${ALERT_TO:-}" ]; then
+            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no direct email"
+            exit 0
+          fi
+          body=$(jq -n --arg to "$ALERT_TO" --arg subject "AW estate: all hosts recovered" \
+            --arg text "All estate hosts answer 200 again. Run: $RUN_URL" \
+            '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
+          if curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
+               -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
+               -d "$body" > /dev/null; then
+            echo "alert email sent"
+          else
+            echo "::error::alert email failed"
+          fi
       - run: |
           echo "::error::All estate hosts answer 200 again. This job fails on purpose so GitHub sends the recovery email."
           exit 1
@@ -183,6 +226,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
+      - name: Email the alert
+        env:
+          RESEND_ALERT_KEY: ${{ secrets.RESEND_ALERT_KEY }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${RESEND_ALERT_KEY:-}" ] || [ -z "${ALERT_TO:-}" ]; then
+            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no direct email"
+            exit 0
+          fi
+          body=$(jq -n --arg to "$ALERT_TO" --arg subject "AW estate: the uptime monitor was silent" \
+            --arg text "GitHub ran no scheduled estate check for more than 6 hours before this run. Run: $RUN_URL" \
+            '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
+          if curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
+               -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
+               -d "$body" > /dev/null; then
+            echo "alert email sent"
+          else
+            echo "::error::alert email failed"
+          fi
       - run: |
           echo "::error::No scheduled run for more than 6 hours before this one; GitHub delayed or skipped the schedule."
           exit 1
