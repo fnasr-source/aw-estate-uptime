@@ -8,7 +8,8 @@
 #   - job "ALERT estate host down"     fails when hosts go from up to down;
 #   - job "NOTICE estate recovered"    fails when hosts go from down to up;
 #   - job "ALERT monitor was silent"   fails when the previous scheduled run is
-#     more than 2 hours old (the schedule itself stopped firing);
+#     more than 6 hours old (GitHub throttles schedules on quiet repos, so 2 hours
+#     raised false alarms);
 #   - a manual run (workflow_dispatch) fails whenever its check fails, so a test
 #     with a .invalid extra_url proves the email path end to end.
 # The current state is recorded by job "state hosts down", which SUCCEEDS on every
@@ -119,7 +120,7 @@ jobs:
             else
               prev_id=${prev%% *}; prev_epoch=${prev##* }
               gap=$(( $(date +%s) - prev_epoch ))
-              [ "$gap" -gt 7200 ] && silent=yes
+              [ "$gap" -gt 21600 ] && silent=yes
               was=$(gh run view "$prev_id" -R "$GITHUB_REPOSITORY" --json jobs \
                       --jq '[.jobs[] | select(.name == "state hosts down" and .conclusion == "success")] | length' \
                       2>/dev/null) || was=""
@@ -183,7 +184,7 @@ jobs:
     timeout-minutes: 2
     steps:
       - run: |
-          echo "::error::No scheduled run for more than 2 hours before this one; GitHub delayed or skipped the schedule."
+          echo "::error::No scheduled run for more than 6 hours before this one; GitHub delayed or skipped the schedule."
           exit 1
 
   # Monthly commit so GitHub never disables the schedule after 60 days without
