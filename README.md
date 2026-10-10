@@ -64,8 +64,9 @@ Works on macOS bash 3.2 and ubuntu-latest; needs only bash, curl, tr, grep and a
   - scheduled run, previously up and now failing: job "ALERT estate host down" fails;
   - scheduled run, previously failing and now up: job "NOTICE estate recovered" fails
     (on purpose: GitHub emails only failed runs);
-  - the previous scheduled run is more than 2 hours old: job "ALERT monitor was silent"
-    fails (the schedule itself stopped firing);
+  - the previous scheduled run is more than 6 hours old: job "ALERT monitor was silent"
+    fails (the schedule itself stopped firing; GitHub throttles 15-minute schedules on
+    quiet repos, so a shorter limit raises false alarms);
   - a manual run fails whenever its check fails, so a test with a `.invalid` extra URL
     proves the email path end to end.
 - Job "state hosts down" succeeds on every run while a host is down and is skipped
@@ -76,7 +77,11 @@ Works on macOS bash 3.2 and ubuntu-latest; needs only bash, curl, tr, grep and a
   log (masked) or in the run summary (only a count). To see which host is down, run
   `bash scripts/estate-uptime/check.sh` in Internal OS.
 - Who receives the email: for scheduled runs, the GitHub account that last changed the
-  schedule in the workflow file; for a manual run, the account that started it; both
+  schedule in the workflow file. That attribution goes by the commit's author email, so
+  publish the workflow through the GitHub API (`gh api -X PUT .../contents/...`, which
+  commits as the signed-in account) or with an email linked to that account; a commit
+  from a local machine address (`user@<host>.local`) is attributed to nobody and no one
+  is mailed (found 2026-10-10); for a manual run, the account that started it; both
   at that account's notification address, with "Actions: notify on failed workflows"
   on in its GitHub notification settings (the default).
 - A monthly heartbeat job (day 1, 03:17 UTC) commits `heartbeat.txt` so GitHub does
