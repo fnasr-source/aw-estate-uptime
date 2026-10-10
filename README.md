@@ -59,7 +59,12 @@ Works on macOS bash 3.2 and ubuntu-latest; needs only bash, curl, tr, grep and a
 - Triggers: every 15 minutes, plus manual `workflow_dispatch` with an optional
   `extra_url` input (the input is visible in the run summary, so never put a client
   host there; it is also masked in the logs).
-- Alerts are GitHub's "run failed" emails. A run fails only on a state change, so an
+- Alerts are direct emails: each alert job first sends one email through Resend
+  (sending-only key for admireworks.com in the secret `RESEND_ALERT_KEY`, recipient in
+  the secret `ALERT_TO`, the key also kept in Secret Manager as `ESTATE_UPTIME_RESEND_KEY`
+  in admireworks---internal-os), then fails so GitHub's own "run failed" email is a
+  second channel. Added 2026-10-10 after GitHub's mail did not arrive.
+- GitHub "run failed" emails: A run fails only on a state change, so an
   outage sends one email when it starts and one when it ends, however long it lasts:
   - scheduled run, previously up and now failing: job "ALERT estate host down" fails;
   - scheduled run, previously failing and now up: job "NOTICE estate recovered" fails
@@ -102,7 +107,10 @@ Prerequisite: decision D58 answered. Nothing below is done by the code task.
    - `scripts/estate-uptime/README.md` to `README.md`
    - `date -u +%Y-%m-%d > heartbeat.txt`
    Do not copy `hosts.json`. Commit and push to `main`.
-4. Set the Actions secret (Settings, Secrets and variables, Actions, Secrets):
+4. Set the Actions secrets (Settings, Secrets and variables, Actions, Secrets):
+   - `RESEND_ALERT_KEY`: a Resend API key with sending access to admireworks.com only
+     (kept in Secret Manager as `ESTATE_UPTIME_RESEND_KEY`).
+   - `ALERT_TO`: the address that receives the alerts.
    - `ESTATE_HOSTS`: the host list as ONE line, generated from the canonical file:
      `bash scripts/estate-uptime/check.sh --hosts-line | gh secret set ESTATE_HOSTS -R fnasr-source/aw-estate-uptime`
    It is a secret, not a variable, on purpose: a variable's value is printed unmasked in
