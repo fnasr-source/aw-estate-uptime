@@ -2,19 +2,25 @@
 # OS repo. Published by COPYING to .github/workflows/estate-uptime.yml in the
 # public repo; never edit the public copy. See README.md.
 #
-# Alerts are emails (owner decision D58 rework, 2026-10-09: email, not ntfy; no
-# paid service). Each alert job first sends a direct email through Resend with a
-# sending-only key for admireworks.com (secrets RESEND_ALERT_KEY and ALERT_TO;
-# added 2026-10-10 because GitHub's own "run failed" mail never arrived), then
-# fails so the run is red and GitHub's mail is a second channel. A run fails ONLY on a state
-# change, so one outage sends one email when it starts and one when it ends:
-#   - job "ALERT estate host down"     fails when hosts go from up to down;
-#   - job "NOTICE estate recovered"    fails when hosts go from down to up;
-#   - job "ALERT monitor was silent"   fails when the previous scheduled run is
-#     more than 6 hours old (GitHub throttles schedules on quiet repos, so 2 hours
-#     raised false alarms);
-#   - a manual run (workflow_dispatch) fails whenever its check fails, so a test
-#     with a .invalid extra_url proves the email path end to end.
+# Alerts go through the Admireworks alert router (quiet inbox, business brain
+# plan Part 2): each state change is POSTed to the portal's router endpoint
+# (secrets OPS_FEED_URL, optional, default https://my.admireworks.com/api/ops-feed/signal,
+# and OPS_FEED_INGEST_SECRET). The router turns "down" into ONE [ACT] email plus
+# push (with one reminder after 24 h if still down), and "recovered" and "silent"
+# (severity high) into morning-page lines, no email. "Down" already means down
+# twice in a row: check.sh retries every failing host once after 60 s.
+# Fallback: when the router cannot be reached (the portal itself may be the host
+# that is down), the down job sends the old direct email through Resend (secrets
+# RESEND_ALERT_KEY and ALERT_TO) and fails, so the run is red. Only a site that is
+# down ever emails: a recovery and a silent monitor never email and never fail the
+# run (a failed run makes GitHub email the account owner).
+#   - job "ALERT estate host down"     on a change from up to down;
+#   - job "NOTICE estate recovered"    on a change from down to up (morning line only);
+#   - job "NOTICE monitor was silent"  when the previous scheduled run is more than
+#     6 hours old (morning line only; GitHub throttles schedules on quiet repos);
+#     router unreachable or secret unset: a ::warning:: in the log, nothing else;
+#   - a manual run (workflow_dispatch) reports whenever its check fails, so a test
+#     with a .invalid extra_url proves the path end to end.
 # The current state is recorded by job "state hosts down", which SUCCEEDS on every
 # run while a host is down and is skipped otherwise; the next run reads it from the
 # previous scheduled run to tell a new outage from a continuing one. The email
@@ -162,30 +168,53 @@ jobs:
     needs: check
     if: needs.check.outputs.transition == 'down' || needs.check.outputs.transition == 'manual_fail'
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
-      - name: Email the alert
+      - name: Tell the alert router
+        id: router
+        env:
+          OPS_FEED_URL: ${{ secrets.OPS_FEED_URL }}
+          OPS_FEED_INGEST_SECRET: ${{ secrets.OPS_FEED_INGEST_SECRET }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          url="${OPS_FEED_URL:-https://my.admireworks.com/api/ops-feed/signal}"
+          if [ -z "${OPS_FEED_INGEST_SECRET:-}" ]; then
+            echo "::warning::OPS_FEED_INGEST_SECRET is not set; using the fallback"
+            echo "routed=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A manual test run reports on its own entity, so it never leaves the
+          # real estate row marked down (no scheduled run would clear it).
+          # The state is unique per transition (down_<UTC minute>): a new outage
+          # after a recovery whose POST was lost is still a new state, so it alerts.
+          ent=estate; [ "$EVENT" = workflow_dispatch ] && ent=manual-test
+          body=$(jq -n --arg run "$RUN_URL" --arg ent "$ent" --arg st "down_$(date -u +%Y%m%d%H%M)" \
+            '{source: "estate-uptime", entityId: $ent, state: $st, severity: (if $ent == "estate" then "critical" else "high" end), title: "An estate site is down", body: "One or more estate hosts stopped answering 200 twice in a row. Host names are not sent; run bash scripts/estate-uptime/check.sh in Internal OS to see which.", link: $run}')
+          if curl -fsS --max-time 20 -X POST "$url" \
+               -H "Authorization: Bearer $OPS_FEED_INGEST_SECRET" -H "Content-Type: application/json" \
+               -d "$body" > /dev/null; then
+            echo "routed"; echo "routed=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::router unreachable"; echo "routed=no" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fallback email (router unreachable)
+        if: steps.router.outputs.routed != 'yes'
         env:
           RESEND_ALERT_KEY: ${{ secrets.RESEND_ALERT_KEY }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "${RESEND_ALERT_KEY:-}" ] || [ -z "${ALERT_TO:-}" ]; then
-            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no direct email"
-            exit 0
-          fi
-          body=$(jq -n --arg to "$ALERT_TO" --arg subject "AW estate: a host is down" \
-            --arg text "One or more estate hosts stopped answering 200. Host names are not in this email or the public log; run bash scripts/estate-uptime/check.sh in Internal OS to see which. Run: $RUN_URL" \
-            '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
-          if curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
-               -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
-               -d "$body" > /dev/null; then
-            echo "alert email sent"
+          if [ -n "${RESEND_ALERT_KEY:-}" ] && [ -n "${ALERT_TO:-}" ]; then
+            body=$(jq -n --arg to "$ALERT_TO" --arg subject "[ACT] AW estate: a host is down" \
+              --arg text "One or more estate hosts stopped answering 200, and the alert router could not be reached. Run bash scripts/estate-uptime/check.sh in Internal OS to see which. Run: $RUN_URL" \
+              '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
+            curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
+              -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
+              -d "$body" > /dev/null && echo "fallback email sent" || echo "::error::fallback email failed"
           else
-            echo "::error::alert email failed"
+            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no fallback email"
           fi
-      - run: |
-          echo "::error::One or more estate hosts stopped answering 200. Host names are masked in this public log; run bash scripts/estate-uptime/check.sh in Internal OS to see which."
+          echo "::error::One or more estate hosts stopped answering 200, and the alert router could not be reached. Run bash scripts/estate-uptime/check.sh in Internal OS to see which."
           exit 1
 
   alert-recovered:
@@ -193,62 +222,66 @@ jobs:
     needs: check
     if: needs.check.outputs.transition == 'recovered'
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
-      - name: Email the alert
+      - name: Tell the alert router
+        id: router
         env:
-          RESEND_ALERT_KEY: ${{ secrets.RESEND_ALERT_KEY }}
-          ALERT_TO: ${{ secrets.ALERT_TO }}
+          OPS_FEED_URL: ${{ secrets.OPS_FEED_URL }}
+          OPS_FEED_INGEST_SECRET: ${{ secrets.OPS_FEED_INGEST_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "${RESEND_ALERT_KEY:-}" ] || [ -z "${ALERT_TO:-}" ]; then
-            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no direct email"
-            exit 0
+          url="${OPS_FEED_URL:-https://my.admireworks.com/api/ops-feed/signal}"
+          if [ -z "${OPS_FEED_INGEST_SECRET:-}" ]; then
+            echo "::warning::OPS_FEED_INGEST_SECRET is not set; using the fallback"
+            echo "routed=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          body=$(jq -n --arg to "$ALERT_TO" --arg subject "AW estate: all hosts recovered" \
-            --arg text "All estate hosts answer 200 again. Run: $RUN_URL" \
-            '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
-          if curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
-               -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
-               -d "$body" > /dev/null; then
-            echo "alert email sent"
+          body=$(jq -n --arg run "$RUN_URL" \
+            '{source: "estate-uptime", entityId: "estate", state: "up", severity: "info", title: "All estate sites answer again", body: "All estate hosts answer 200 again.", link: $run, resolved: true}')
+          # One retry: a lost recovery would leave the row open and earn a
+          # needless 24 h reminder.
+          post() { curl -fsS --max-time 20 -X POST "$url" \
+               -H "Authorization: Bearer $OPS_FEED_INGEST_SECRET" -H "Content-Type: application/json" \
+               -d "$body" > /dev/null; }
+          if post || { sleep 30; post; }; then
+            echo "routed"; echo "routed=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::alert email failed"
+            echo "::warning::router unreachable"; echo "routed=no" >> "$GITHUB_OUTPUT"
           fi
-      - run: |
-          echo "::error::All estate hosts answer 200 again. This job fails on purpose so GitHub sends the recovery email."
-          exit 1
 
+  # Morning line only, never an email (owner, 21 Oct 2026): no fallback email,
+  # and the job never fails the run, because a failed run makes GitHub email the
+  # account owner. A site that is down still alerts through job alert-down.
   alert-silent:
-    name: ALERT monitor was silent
+    name: NOTICE monitor was silent
     needs: check
     if: needs.check.outputs.silent == 'yes'
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
+    continue-on-error: true
     steps:
-      - name: Email the alert
+      - name: Tell the alert router
         env:
-          RESEND_ALERT_KEY: ${{ secrets.RESEND_ALERT_KEY }}
-          ALERT_TO: ${{ secrets.ALERT_TO }}
+          OPS_FEED_URL: ${{ secrets.OPS_FEED_URL }}
+          OPS_FEED_INGEST_SECRET: ${{ secrets.OPS_FEED_INGEST_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "${RESEND_ALERT_KEY:-}" ] || [ -z "${ALERT_TO:-}" ]; then
-            echo "::error::RESEND_ALERT_KEY or ALERT_TO is not set; no direct email"
+          set +e
+          url="${OPS_FEED_URL:-https://my.admireworks.com/api/ops-feed/signal}"
+          if [ -z "${OPS_FEED_INGEST_SECRET:-}" ]; then
+            echo "::warning::OPS_FEED_INGEST_SECRET is not set; the silent-monitor line was not posted (no email by design)"
             exit 0
           fi
-          body=$(jq -n --arg to "$ALERT_TO" --arg subject "AW estate: the uptime monitor was silent" \
-            --arg text "GitHub ran no scheduled estate check for more than 6 hours before this run. Run: $RUN_URL" \
-            '{from: "Admireworks <hello@admireworks.com>", to: [$to], subject: $subject, text: $text}')
-          if curl -fsS --max-time 20 -X POST https://api.resend.com/emails \
-               -H "Authorization: Bearer $RESEND_ALERT_KEY" -H "Content-Type: application/json" \
+          body=$(jq -n --arg run "$RUN_URL" --arg st "silent_$(date -u +%Y%m%d)" \
+            '{source: "estate-uptime", entityId: "monitor", state: $st, severity: "high", title: "The uptime monitor was silent", body: "GitHub ran no scheduled estate check for more than 6 hours before this run.", link: $run}')
+          if [ -n "$body" ] && curl -fsS --max-time 20 -X POST "$url" \
+               -H "Authorization: Bearer $OPS_FEED_INGEST_SECRET" -H "Content-Type: application/json" \
                -d "$body" > /dev/null; then
-            echo "alert email sent"
+            echo "routed"
           else
-            echo "::error::alert email failed"
+            echo "::warning::router unreachable; the silent-monitor line was not posted (no email by design)"
           fi
-      - run: |
-          echo "::error::No scheduled run for more than 6 hours before this one; GitHub delayed or skipped the schedule."
-          exit 1
+          exit 0
 
   # Monthly commit so GitHub never disables the schedule after 60 days without
   # repository activity. The only job with write access.

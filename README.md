@@ -1,9 +1,11 @@
 # aw-estate-uptime
 
 A small public-hosts uptime monitor. Every 15 minutes a GitHub Actions run fetches
-each host over HTTPS and requires a final HTTP 200. A state change (down, recovered)
-or a silent monitor makes the run fail on purpose, so GitHub's own "run failed" email
-reaches the account that owns the workflow. No push service and no paid service. Nothing else is monitored here and
+each host over HTTPS and requires a final HTTP 200. A host going down is sent to the
+Admireworks alert router (one email plus push); only when the router cannot be reached
+does the run fail on purpose, so GitHub's own "run failed" email reaches the account
+that owns the workflow. A recovery or a silent monitor is a morning-page line and never
+fails the run. No push service and no paid service. Nothing else is monitored here and
 no Google Cloud resource is used (a Cloud Monitoring check would bill through the
 shared card and die with it).
 
@@ -59,29 +61,37 @@ Works on macOS bash 3.2 and ubuntu-latest; needs only bash, curl, tr, grep and a
 - Triggers: every 15 minutes, plus manual `workflow_dispatch` with an optional
   `extra_url` input (the input is visible in the run summary, so never put a client
   host there; it is also masked in the logs).
-- Alerts are direct emails: each alert job first sends one email through Resend
-  (sending-only key for admireworks.com in the secret `RESEND_ALERT_KEY`, recipient in
-  the secret `ALERT_TO`, the key also kept in Secret Manager as `ESTATE_UPTIME_RESEND_KEY`
-  in admireworks---internal-os), then fails so GitHub's own "run failed" email is a
-  second channel. Added 2026-10-10 after GitHub's mail did not arrive.
-- GitHub "run failed" emails: A run fails only on a state change, so an
-  outage sends one email when it starts and one when it ends, however long it lasts:
-  - scheduled run, previously up and now failing: job "ALERT estate host down" fails;
-  - scheduled run, previously failing and now up: job "NOTICE estate recovered" fails
-    (on purpose: GitHub emails only failed runs);
-  - the previous scheduled run is more than 6 hours old: job "ALERT monitor was silent"
-    fails (the schedule itself stopped firing; GitHub throttles 15-minute schedules on
-    quiet repos, so a shorter limit raises false alarms);
-  - a manual run fails whenever its check fails, so a test with a `.invalid` extra URL
-    proves the email path end to end.
+- Alerts go through the Admireworks alert router (quiet inbox, 19 Oct 2026): each
+  state change is POSTed to the portal (`OPS_FEED_URL`, default
+  `https://my.admireworks.com/api/ops-feed/signal`, Bearer `OPS_FEED_INGEST_SECRET`).
+  The router sends ONE `[ACT]` email plus push when hosts go down (one reminder after
+  24 h if still down) and puts the recovery on the portal morning page with no email.
+  "Down" already means down twice in a row: `check.sh` retries each failure after 60 s.
+  - scheduled run, previously up and now failing: job "ALERT estate host down" posts `down`;
+  - scheduled run, previously failing and now up: job "NOTICE estate recovered" posts
+    `up` (resolved); it never emails and never fails the run;
+  - the previous scheduled run is more than 6 hours old: job "NOTICE monitor was silent"
+    posts a morning line (severity `high`; GitHub throttles 15-minute schedules on quiet
+    repos); it never emails and never fails the run (a failed run makes GitHub email the
+    account owner). If the router cannot be reached or `OPS_FEED_INGEST_SECRET` is unset,
+    it prints a `::warning::` in the log and nothing else. A site that is down still
+    alerts through job "ALERT estate host down";
+  - a manual run whose check fails posts a morning line on its own `manual-test` entity,
+    so a test with a `.invalid` extra URL proves the path without leaving the estate
+    marked down.
+- Fallback when the router cannot be reached (the portal may be the host that is
+  down): only the down job sends the old direct email through Resend
+  (`RESEND_ALERT_KEY`, recipient `ALERT_TO`; key kept in Secret Manager as
+  `ESTATE_UPTIME_RESEND_KEY` in admireworks---internal-os) and fails the run. The
+  recovered and silent jobs have no fallback email.
 - Job "state hosts down" succeeds on every run while a host is down and is skipped
   otherwise; the next run reads it from the previous scheduled run to tell a new outage
   from a continuing one. If that history cannot be read, a failing check is treated as
   a new outage (an email rather than silence).
-- The email names only the failed job. Host names never appear in it, in the public
+- No host name is ever posted or emailed. Host names never appear in the public
   log (masked) or in the run summary (only a count). To see which host is down, run
   `bash scripts/estate-uptime/check.sh` in Internal OS.
-- Who receives the email: for scheduled runs, the GitHub account that last changed the
+- Who receives GitHub's own "run failed" email (down-fallback runs only): for scheduled runs, the GitHub account that last changed the
   schedule in the workflow file. That attribution goes by the commit's author email, so
   publish the workflow through the GitHub API (`gh api -X PUT .../contents/...`, which
   commits as the signed-in account) or with an email linked to that account; a commit
@@ -110,7 +120,10 @@ Prerequisite: decision D58 answered. Nothing below is done by the code task.
 4. Set the Actions secrets (Settings, Secrets and variables, Actions, Secrets):
    - `RESEND_ALERT_KEY`: a Resend API key with sending access to admireworks.com only
      (kept in Secret Manager as `ESTATE_UPTIME_RESEND_KEY`).
-   - `ALERT_TO`: the address that receives the alerts.
+   - `ALERT_TO`: the address that receives the fallback down alert.
+   - `OPS_FEED_INGEST_SECRET`: the same value as the portal's `OPS_FEED_INGEST_SECRET`
+     (Secret Manager, admireworks---internal-os). Never the cron secret: this repo is public.
+   - `OPS_FEED_URL` (optional): only to point at another router address.
    - `ESTATE_HOSTS`: the host list as ONE line, generated from the canonical file:
      `bash scripts/estate-uptime/check.sh --hosts-line | gh secret set ESTATE_HOSTS -R fnasr-source/aw-estate-uptime`
    It is a secret, not a variable, on purpose: a variable's value is printed unmasked in
@@ -126,9 +139,10 @@ command above. The workflow file and `check.sh` change only by re-copying them.
 
 ## Limits to know about
 
-- GitHub scheduled runs can be delayed or skipped under load; the 2-hour silent check
+- GitHub scheduled runs can be delayed or skipped under load; the 6-hour silent check
   exists for that, and it can only fire when some run does happen.
-- GitHub sends one email per failed run; a state change fails exactly one run, so a
-  flapping host can still send several emails in an hour.
+- GitHub sends one email per failed run; only a down that could not reach the router
+  fails a run, so a flapping host while the router is unreachable can still send
+  several emails in an hour.
 - Nothing is checked beyond status 200 on the home path: no content, TLS expiry or
   latency check.
